@@ -34,6 +34,74 @@ struct guest_layout<VkDescriptorDataEXT> {
 
 #include <common/X11Manager.h>
 
+#include <cstdlib>
+#include <unistd.h>
+
+// This host library runs natively (aarch64) inside the pressure-vessel
+// container. The guest's Vulkan loader is replaced by the thunk stub, but the
+// *host* loader still has to be found: the graphics provider does not put the
+// host's libvulkan.so.1 or its ICD on the aarch64 search path, so point the
+// loader explicitly at the host root, which pressure-vessel exposes at
+// /run/host. Outside a container these paths do not exist and nothing changes.
+static void PreloadHostVulkanStack() {
+  for (const char* Loader : {"/run/host/usr/lib64/libvulkan.so.1", "/run/host/usr/lib/aarch64-linux-gnu/libvulkan.so.1"}) {
+    if (access(Loader, R_OK) == 0) {
+      void* Handle = dlopen(Loader, RTLD_GLOBAL | RTLD_LAZY);
+      fprintf(stderr, "thunk-vulkan: preloaded host loader %s -> %p (%s)\n", Loader, Handle, Handle ? "ok" : dlerror());
+      break;
+    }
+  }
+
+  // The ICD JSON's library_path is relative, so the loader resolves it against
+  // its own search path rather than the JSON's directory once it is not on the
+  // host's ld.so.conf. Load both the JSON's driver and the ICD library by
+  // absolute path so the loader finds an already-loaded object by SONAME.
+  for (const char* ICD : {"/run/host/usr/lib/aarch64-linux-gnu/tegra/nvidia_icd.json"}) {
+    if (access(ICD, R_OK) == 0) {
+      setenv("VK_ICD_FILENAMES", ICD, 1);
+      setenv("VK_DRIVER_FILES", ICD, 1);
+      fprintf(stderr, "thunk-vulkan: using host ICD %s\n", ICD);
+      break;
+    }
+  }
+
+  for (const char* Driver : {"/run/host/usr/lib/aarch64-linux-gnu/tegra/libGLX_nvidia.so.0"}) {
+    if (access(Driver, R_OK) == 0) {
+      void* Handle = dlopen(Driver, RTLD_GLOBAL | RTLD_LAZY);
+      fprintf(stderr, "thunk-vulkan: preloaded ICD driver %s -> %p (%s)\n", Driver, Handle, Handle ? "ok" : dlerror());
+      break;
+    }
+  }
+
+  // The NVIDIA Vulkan ICD initialises its GPU/GLX layer through EGL. Inside the
+  // container glvnd only sees Mesa's vendor json, the driver then fails to
+  // initialise and returns NULL for every ICD entry point (the loader then
+  // reports "Failed to detect any valid GPUs"). Point glvnd at the host's
+  // NVIDIA vendor json and preload the vendor library (and its libnvidia-glsi
+  // dependency) by SONAME so glvnd's dlopen() resolves to the loaded object.
+  static constexpr const char* NvidiaEglVendor = "/run/host/usr/share/glvnd/egl_vendor.d/10_nvidia.json";
+  static constexpr const char* MesaLegacyEglVendor = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+  if (access(NvidiaEglVendor, R_OK) == 0) {
+    char Vendors[512];
+    if (access(MesaLegacyEglVendor, R_OK) == 0) {
+      snprintf(Vendors, sizeof(Vendors), "%s:%s", NvidiaEglVendor, MesaLegacyEglVendor);
+    } else {
+      snprintf(Vendors, sizeof(Vendors), "%s", NvidiaEglVendor);
+    }
+    setenv("__EGL_VENDOR_LIBRARY_FILENAMES", Vendors, 1);
+    fprintf(stderr, "thunk-vulkan: EGL vendors %s\n", Vendors);
+  }
+
+  for (const char* Lib : {"/run/host/usr/lib/aarch64-linux-gnu/tegra/libnvidia-glsi.so.32.7.6",
+                          "/run/host/usr/lib/aarch64-linux-gnu/tegra-egl/libEGL_nvidia.so.0"}) {
+    if (access(Lib, R_OK) == 0) {
+      void* Handle = dlopen(Lib, RTLD_GLOBAL | RTLD_LAZY);
+      fprintf(stderr, "thunk-vulkan: preloaded %s -> %p (%s)\n", Lib, Handle, Handle ? "ok" : dlerror());
+    }
+  }
+}
+static const bool PreloadedHostVulkanStack = (PreloadHostVulkanStack(), true);
+
 static bool SetupInstance {};
 static std::mutex SetupMutex {};
 
