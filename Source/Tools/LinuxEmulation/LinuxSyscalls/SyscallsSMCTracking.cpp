@@ -23,11 +23,13 @@ $end_info$
 #include "LinuxSyscalls/SignalDelegator.h"
 
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
+#include <FEXHeaderUtils/Syscalls.h>
 #include <Linux/Utils/ELFParser.h>
 
 namespace FEX::HLE {
@@ -42,16 +44,11 @@ static void HandleSegfaultForCodeCacheFinalization(FEXCore::Core::InternalThread
   }
 }
 
-// Invalidates the translated code of one guest page that is being written and makes it writable again (the page is
-// write-protected while it holds code, SMCChecks=mtrack). Every mirror of a shared mapping is flushed.
+// Collects the translated code ranges of one guest page that is being written. Every mirror of a shared mapping is
+// flushed, because code usually executes from a different mirror than the one that is written through.
 // Callers hold VMATracking.Mutex (shared) and have checked that the guest mapping is writable.
-void SyscallHandler::InvalidateWrittenCodePage(FEXCore::Core::InternalThreadState* Thread, uint64_t FaultBase, uint64_t EntryBase,
-                                               const FEX::HLE::VMATracking::VMAEntry& Mapping) {
-  auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
-    auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
-    LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
-  };
-
+void SyscallHandler::CollectWrittenCodePages(uint64_t FaultBase, uint64_t EntryBase, const FEX::HLE::VMATracking::VMAEntry& Mapping,
+                                             fextl::vector<CodeRangeToInvalidate>& Ranges) {
   if (Mapping.Flags.Shared) {
     LOGMAN_THROW_A_FMT(Mapping.Resource, "VMA tracking error");
 
@@ -64,21 +61,38 @@ void SyscallHandler::InvalidateWrittenCodePage(FEXCore::Core::InternalThreadStat
     do {
       if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
         auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
-
-        if (VMA->Prot.Writable) {
-          _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-        } else {
-          _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
-        }
-
-        // Code usually executes from a different mirror than the one that is written through, so every mirror
-        // is accounted: the one that is translated has to become hot.
-        _SyscallHandler->SMCHotPages.RecordFault(FaultBaseMirrored, _SyscallHandler->SMCHotPageFaults());
+        Ranges.push_back({FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, VMA->Prot.Writable, true});
       }
     } while ((VMA = VMA->ResourceNextVMA));
   } else {
-    _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-    _SyscallHandler->SMCHotPages.RecordFault(FaultBase, _SyscallHandler->SMCHotPageFaults());
+    Ranges.push_back({FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, true, true});
+  }
+}
+
+// Invalidates the translated code of the ranges collected by CollectWrittenCodePages.
+//
+// Must be called with VMATracking.Mutex released. InvalidateGuestCodeRange takes the exclusive code invalidation lock,
+// while CompileBlock takes that lock shared and then takes VMATracking.Mutex. Invalidating while holding
+// VMATracking.Mutex inverts that lock order and deadlocks: a writer waiting for VMATracking.Mutex blocks new readers,
+// one of which holds the code invalidation lock shared and therefore blocks us.
+void SyscallHandler::InvalidateCodeRanges(FEXCore::Core::InternalThreadState* Thread, const fextl::vector<CodeRangeToInvalidate>& Ranges) {
+  auto UnprotectRegionCallback = [](uintptr_t Start, uintptr_t Length) {
+    auto rv = mprotect((void*)Start, Length, PROT_READ | PROT_WRITE);
+    LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
+  };
+
+  // Signals stay masked across the invalidation, just as they were while VMATracking.Mutex was held.
+  FEXCore::ScopedSignalMasker Masker {~0ULL};
+  for (const auto& Range : Ranges) {
+    if (Range.Unprotect) {
+      FEX::HLE::_SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Range.Address, Range.Length, UnprotectRegionCallback);
+    } else {
+      FEX::HLE::_SyscallHandler->TM.InvalidateGuestCodeRange(Thread, Range.Address, Range.Length);
+    }
+
+    if (Range.RecordHotPage) {
+      FEX::HLE::_SyscallHandler->SMCHotPages.RecordFault(Range.Address, FEX::HLE::_SyscallHandler->SMCHotPageFaults());
+    }
   }
 }
 
@@ -105,33 +119,40 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
   }
 
   {
-    // Can't use the deferred signal lock in the SIGSEGV handler.
-    auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
+    // Collected under VMATracking.Mutex but invalidated after dropping it, see InvalidateCodeRanges.
+    fextl::vector<CodeRangeToInvalidate> Ranges;
 
-    auto& VMATracking = _SyscallHandler->VMATracking;
+    {
+      // Can't use the deferred signal lock in the SIGSEGV handler.
+      auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
 
-    // If the write spans two pages, they will be flushed one at a time (generating two faults)
-    auto Entry = VMATracking.FindVMAEntry(FaultAddress);
+      auto& VMATracking = _SyscallHandler->VMATracking;
 
-    if (Entry == VMATracking.VMAs.end()) {
-      // Not a guest page; check mapped code cache pages
-      auto* Code = VMATracking.FindMappedCodeCacheByHostAddress(FaultAddress);
-      if (!Code) {
-        // Untracked address; not handled here
+      // If the write spans two pages, they will be flushed one at a time (generating two faults)
+      auto Entry = VMATracking.FindVMAEntry(FaultAddress);
+
+      if (Entry == VMATracking.VMAs.end()) {
+        // Not a guest page; check mapped code cache pages
+        auto* Code = VMATracking.FindMappedCodeCacheByHostAddress(FaultAddress);
+        if (!Code) {
+          // Untracked address; not handled here
+          return false;
+        }
+        std::lock_guard lk(_SyscallHandler->CodeCachePatchingMutex);
+        HandleSegfaultForCodeCacheFinalization(*Thread, *Code, FaultAddress);
+        return true;
+      }
+
+      // If the mapping wasn't writable, it can't be handled here
+      if (!Entry->second.Prot.Writable) {
         return false;
       }
-      std::lock_guard lk(_SyscallHandler->CodeCachePatchingMutex);
-      HandleSegfaultForCodeCacheFinalization(*Thread, *Code, FaultAddress);
-      return true;
+
+      auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
+      CollectWrittenCodePages(FaultBase, Entry->first, Entry->second, Ranges);
     }
 
-    // If the mapping wasn't writable, it can't be handled here
-    if (!Entry->second.Prot.Writable) {
-      return false;
-    }
-
-    auto FaultBase = FEXCore::AlignDown(FaultAddress, FEXCore::Utils::FEX_PAGE_SIZE);
-    InvalidateWrittenCodePage(Thread, FaultBase, Entry->first, Entry->second);
+    InvalidateCodeRanges(Thread, Ranges);
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
 
@@ -172,36 +193,40 @@ void SyscallHandler::PrepareGuestBufferForKernelWrite(FEXCore::Core::InternalThr
   // Exclusive page-aligned end; the last page of the address space is never guest memory.
   const uint64_t End = FEXCore::AlignDown(Last, FEXCore::Utils::FEX_PAGE_SIZE) + (Last >= UINT64_MAX - FEXCore::Utils::FEX_PAGE_SIZE ? 0 : FEXCore::Utils::FEX_PAGE_SIZE);
 
-  auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
+  // Collected under VMATracking.Mutex but invalidated after dropping it, see InvalidateCodeRanges.
+  fextl::vector<CodeRangeToInvalidate> Ranges;
 
-  // upper_bound gives the first VMA starting after Start; the one before it may still contain Start.
-  auto Entry = VMATracking.VMAs.upper_bound(Start);
-  if (Entry != VMATracking.VMAs.begin() && std::prev(Entry)->first + std::prev(Entry)->second.Length > Start) {
-    --Entry;
-  }
+  {
+    auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
 
-  for (; Entry != VMATracking.VMAs.end() && Entry->first < End; ++Entry) {
-    const auto& Mapping = Entry->second;
-    // The kernel's answer is the real one for memory the guest cannot write; private non-executable memory never
-    // holds translated code.
-    if (!Mapping.Prot.Writable || !(Mapping.Prot.Executable || Mapping.Flags.Shared)) [[likely]] {
-      continue;
+    // upper_bound gives the first VMA starting after Start; the one before it may still contain Start.
+    auto Entry = VMATracking.VMAs.upper_bound(Start);
+    if (Entry != VMATracking.VMAs.begin() && std::prev(Entry)->first + std::prev(Entry)->second.Length > Start) {
+      --Entry;
     }
-    const uint64_t From = std::max(Start, Entry->first);
-    const uint64_t To = std::min(End, Entry->first + Mapping.Length);
-    if (Mapping.Flags.Shared) {
-      // Code may be translated from another mirror of the same pages: flush every mirror, page by page.
-      for (uint64_t Page = From; Page < To; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
-        InvalidateWrittenCodePage(Thread, Page, Entry->first, Mapping);
+
+    for (; Entry != VMATracking.VMAs.end() && Entry->first < End; ++Entry) {
+      const auto& Mapping = Entry->second;
+      // The kernel's answer is the real one for memory the guest cannot write; private non-executable memory never
+      // holds translated code.
+      if (!Mapping.Prot.Writable || !(Mapping.Prot.Executable || Mapping.Flags.Shared)) [[likely]] {
+        continue;
       }
-    } else {
-      // One invalidation for the whole range; pages without code (and hot pages, already writable) just stay writable.
-      TM.InvalidateGuestCodeRange(Thread, From, To - From, [](uintptr_t Start, uintptr_t Length) {
-        auto rv = mprotect(reinterpret_cast<void*>(Start), Length, PROT_READ | PROT_WRITE);
-        LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", Start, Length);
-      });
+      const uint64_t From = std::max(Start, Entry->first);
+      const uint64_t To = std::min(End, Entry->first + Mapping.Length);
+      if (Mapping.Flags.Shared) {
+        // Code may be translated from another mirror of the same pages: flush every mirror, page by page.
+        for (uint64_t Page = From; Page < To; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+          CollectWrittenCodePages(Page, Entry->first, Mapping, Ranges);
+        }
+      } else {
+        // One invalidation for the whole range; pages without code (and hot pages, already writable) just stay writable.
+        Ranges.push_back({From, To - From, true, false});
+      }
     }
   }
+
+  InvalidateCodeRanges(Thread, Ranges);
 }
 
 bool SyscallHandler::IsSMCHotPage(uint64_t Address) {
@@ -414,8 +439,23 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
       }
       LOGMAN_THROW_A_FMT(Is64Bit || (Result >> 32) == 0 || (Result >> 32) == 0xFFFFFFFF, "values must fit to 32 bits");
     } else {
-      Result = reinterpret_cast<uint64_t>(::mmap(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
+      Result = reinterpret_cast<uint64_t>(FHU::Syscalls::MmapFixedNoReplace(reinterpret_cast<void*>(addr), length, prot, flags, fd, offset));
       if (Result == ~0ULL) {
+        // On kernels without MAP_FIXED_NOREPLACE (e.g. NVIDIA L4T 4.9) the flag is
+        // ignored and the address is only a hint. MmapFixedNoReplace reports EEXIST
+        // when the hint was not honoured, but an address beyond the host's usable VA
+        // range is also "not honoured" and must report ENOMEM, not EEXIST. Wine's
+        // virtual_init() probes the host address-space limit this way and treats
+        // EEXIST as the top of the address space, which would make it attempt a
+        // multi-gigabyte allocation and abort.
+        if (errno == EEXIST && (flags & MAP_FIXED_NOREPLACE) != 0) {
+          const uintptr_t Start = reinterpret_cast<uintptr_t>(addr);
+          const uintptr_t End = Start + length;
+          const uintptr_t Limit = uintptr_t{1} << FEXCore::Allocator::GetHostVABits();
+          if (Start >= Limit || End > Limit || End < Start) {
+            errno = ENOMEM;
+          }
+        }
         return reinterpret_cast<void*>(-errno);
       }
     }

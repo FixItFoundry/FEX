@@ -288,9 +288,21 @@ public:
 
 
   ///// VMA (Virtual Memory Area) tracking /////
+  // A guest range whose translated code has to be dropped because the guest is writing it.
+  struct CodeRangeToInvalidate {
+    uint64_t Address;
+    uint64_t Length;
+    // The mapping is writable, so the page has to be made writable again after the invalidation. Read-only mirrors of
+    // a shared mapping only need their translated code dropped.
+    bool Unprotect;
+    // Count this as an SMC fault on the page (see SMCHotPageTracker).
+    bool RecordHotPage;
+  };
+
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
-  static void InvalidateWrittenCodePage(FEXCore::Core::InternalThreadState* Thread, uint64_t FaultBase, uint64_t EntryBase,
-                                        const FEX::HLE::VMATracking::VMAEntry& Mapping);
+  static void CollectWrittenCodePages(uint64_t FaultBase, uint64_t EntryBase, const FEX::HLE::VMATracking::VMAEntry& Mapping,
+                                      fextl::vector<CodeRangeToInvalidate>& Ranges);
+  static void InvalidateCodeRanges(FEXCore::Core::InternalThreadState* Thread, const fextl::vector<CodeRangeToInvalidate>& Ranges);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   bool IsSMCHotPage(uint64_t Address) override;
 
