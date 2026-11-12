@@ -234,7 +234,7 @@ void* OSAllocator_64Bit::Mmap(void* addr, size_t length, int prot, int flags, in
   if (addr != 0 && addr < reinterpret_cast<void*>(LOWER_BOUND)) {
     // If we are asked to allocate something outside of the 64-bit space
     // Then we need to just hand this to the OS
-    return ::mmap(addr, length, prot, flags, fd, offset);
+    return FHU::Syscalls::MmapFixedNoReplace(addr, length, prot, flags, fd, offset);
   }
 
   uint64_t Addr = reinterpret_cast<uint64_t>(addr);

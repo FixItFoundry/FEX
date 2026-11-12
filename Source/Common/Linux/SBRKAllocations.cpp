@@ -4,6 +4,7 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/TypeDefines.h>
+#include <FEXHeaderUtils/Syscalls.h>
 
 #include <sys/mman.h>
 
@@ -28,8 +29,8 @@ void* DisableSBRKAllocations() {
   // In most cases at the start of `main` this will already be page aligned, which means subsequent `sbrk`
   // calls won't allocate any memory through that.
   void* AlignedBRK = reinterpret_cast<void*>(FEXCore::AlignUp(reinterpret_cast<uintptr_t>(StartingSBRK), FEXCore::Utils::FEX_PAGE_SIZE));
-  void* AfterBRK =
-    ::mmap(AlignedBRK, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+  void* AfterBRK = FHU::Syscalls::MmapFixedNoReplace(AlignedBRK, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE,
+                                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
   if (AfterBRK == INVALID_PTR) {
     // Couldn't allocate the page after the aligned brk? This should never happen.
     // FEXCore::LogMan isn't configured yet so we just need to print the message.

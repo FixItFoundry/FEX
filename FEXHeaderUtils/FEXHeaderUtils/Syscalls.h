@@ -8,6 +8,9 @@
 #include <signal.h>
 #include <stdio.h>
 #ifndef _WIN32
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 #include <syscall.h>
 #else
 #include <processthreadsapi.h>
@@ -18,6 +21,31 @@
 namespace FHU::Syscalls {
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+#ifndef _WIN32
+// Kernels older than 4.17 (for example NVIDIA L4T's 4.9) silently ignore
+// MAP_FIXED_NOREPLACE, turning the request into a best-effort hint. Emulate the
+// documented semantics: map as if the flag were absent, then require the kernel
+// to have honoured the hint exactly, otherwise fail with EEXIST.
+static inline void* MmapFixedNoReplace(void* Addr, size_t Length, int Prot, int Flags, int FD, off_t Offset) {
+  if (!(Flags & MAP_FIXED_NOREPLACE)) {
+    return ::mmap(Addr, Length, Prot, Flags, FD, Offset);
+  }
+
+  void* Ptr = ::mmap(Addr, Length, Prot, Flags & ~MAP_FIXED_NOREPLACE, FD, Offset);
+  if (Ptr == MAP_FAILED) {
+    return Ptr;
+  }
+
+  if (Ptr != Addr) {
+    ::munmap(Ptr, Length);
+    errno = EEXIST;
+    return MAP_FAILED;
+  }
+
+  return Ptr;
+}
 #endif
 
 #ifndef SEM_STAT_ANY

@@ -120,11 +120,16 @@ FEX_DEFAULT_VISIBILITY size_t GetHostVABits() {
     // If this succeeds OR the page is reported as already existing,
     // we know we're in valid VA space. Otherwise, we must go lower.
     void* Addr = reinterpret_cast<void*>((1ULL << Bits) - FEXCore::Utils::FEX_PAGE_SIZE);
+    errno = 0;
     void* Ptr = ::mmap(Addr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (Ptr != (void*)~0ULL) {
+    if (Ptr != MAP_FAILED) {
       ::munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
     }
-    if (Ptr != (void*)~0ULL || errno == EEXIST) {
+    // Kernels older than 4.17 ignore MAP_FIXED_NOREPLACE and treat the address as
+    // a hint, which can silently succeed outside the usable VA range. Only an
+    // exact hit, or EEXIST from a kernel that honours the flag, proves the address
+    // is inside the valid VA space.
+    if (Ptr == Addr || (Ptr == MAP_FAILED && errno == EEXIST)) {
       HostVABits = Bits;
       return Bits;
     }
@@ -260,7 +265,7 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   // Block remaining memory gaps
   bool SupportsDontDump = true;
   for (auto RegionIt = Regions.begin(); RegionIt != Regions.end(); ++RegionIt) {
-    auto Alloc = ::mmap(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+    auto Alloc = FHU::Syscalls::MmapFixedNoReplace(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 
     if (SupportsDontDump) {
       // Mark these regions as don't dump so that coredump doesn't try dumping large unmapped regions.
@@ -280,7 +285,12 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
 
 fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
   size_t Bits = FEXCore::Allocator::GetHostVABits();
-  if (Bits < 48) {
+  // This path exists to carve out the [2^47, 2^48) region so that a host with more than 48 bits of
+  // user VA still presents a 48-bit address space to the guest. On a host whose user VA is exactly
+  // 2^48 (this kernel: TASK_SIZE == 2^48) there is no space above 48 bits to reclaim and running
+  // this path would steal the entire [2^47, 2^48) range from the normal allocator. Only enable it
+  // when the host VA is strictly greater than 48 bits.
+  if (Bits < 49) {
     return {};
   }
 

@@ -192,8 +192,8 @@ restart: {
   }
   {
     // Try and map the range
-    void* MappedPtr =
-      ::mmap(reinterpret_cast<void*>(LowerPage << FEXCore::Utils::FEX_PAGE_SHIFT), length, prot, flags | FEX_MAP_FIXED_NOREPLACE, fd, offset);
+    void* MappedPtr = FHU::Syscalls::MmapFixedNoReplace(reinterpret_cast<void*>(LowerPage << FEXCore::Utils::FEX_PAGE_SHIFT), length, prot,
+                                                       flags | FEX_MAP_FIXED_NOREPLACE, fd, offset);
 
     if (MappedPtr == MAP_FAILED && errno != EEXIST) {
       return reinterpret_cast<void*>(-errno);
@@ -231,8 +231,8 @@ restart: {
   if (Addr == 0) {
     return AllocateNoHint();
   } else {
-    void* MappedPtr = ::mmap(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT),
-                             PagesLength << FEXCore::Utils::FEX_PAGE_SHIFT, prot, flags, fd, offset);
+    void* MappedPtr = FHU::Syscalls::MmapFixedNoReplace(reinterpret_cast<void*>(PageAddr << FEXCore::Utils::FEX_PAGE_SHIFT),
+                                                       PagesLength << FEXCore::Utils::FEX_PAGE_SHIFT, prot, flags, fd, offset);
 
     if (MappedPtr != MAP_FAILED) {
       SetUsedPages(PageAddr, PagesLength);
